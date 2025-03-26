@@ -26,6 +26,25 @@ This project aims to develop a machine learning model capable of predicting the 
    python src/data_collection.py
    ```
 
+## Multi-Season Training
+
+This project supports training with data from multiple MLB seasons to improve model accuracy:
+
+1. Collect data from multiple seasons:
+   ```
+   python src/collect_seasons.py --seasons 2021 2022 2023
+   ```
+
+2. Train models using the collected data:
+   ```
+   python run_pipeline.py --skip-collection
+   ```
+
+3. Or use the all-in-one demo script:
+   ```
+   python multi_season_demo.py
+   ```
+
 ## Features
 
 The model will consider the following features for prediction:
@@ -34,6 +53,7 @@ The model will consider the following features for prediction:
 - Batter's performance against different pitch types
 - Game situation (count, outs, runners, score)
 - Inning and game context
+- Season information (when using multi-season data)
 
 ## Model Development Plan
 
@@ -43,4 +63,21 @@ The model will consider the following features for prediction:
 4. Feature Engineering: Create meaningful inputs for the model
 5. Model Training: Test various algorithms (logistic regression, decision trees, XGBoost, etc.)
 6. Evaluation: Assess models using confusion matrices and accuracy metrics
-7. Deployment: Prepare model for real-time prediction 
+7. Deployment: Prepare model for real-time prediction
+
+## Making Predictions
+
+To make predictions with a trained model:
+
+```
+python src/predict.py --interactive
+```
+
+This will open an interactive session where you can input game situations and get pitch predictions.
+
+## Custom Data Collection
+
+To collect data for a specific date range:
+
+```
+python run_pipeline.py --start-date "2023-04-01" --end-date "2023-10-01" 

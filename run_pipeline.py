@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def run_script(script_path, description):
+def run_script(script_path, description, args=None):
     """
     Run a Python script and log the output
     
@@ -34,6 +34,8 @@ def run_script(script_path, description):
         Path to the Python script
     description : str
         Description of the step for logging
+    args : list, optional
+        Command line arguments to pass to the script
     
     Returns:
     --------
@@ -44,15 +46,14 @@ def run_script(script_path, description):
     start_time = time.time()
     
     try:
+        # Build the command
+        command = [sys.executable, script_path]
+        if args:
+            command.extend(args)
+            
         # Run the script as a subprocess
-        # result = subprocess.run(
-        #     ["python", script_path],
-        #     check=True,
-        #     capture_output=True,
-        #     text=True
-        # )
         result = subprocess.run(
-            [sys.executable, script_path],
+            command,
             check=True,
             capture_output=True,
             text=True
@@ -96,8 +97,17 @@ def main():
     """Main function to run the pipeline"""
     parser = argparse.ArgumentParser(description='Run Baseball Pitch Prediction Pipeline')
     
+    # Date range options for single-season collection
     parser.add_argument('--start-date', type=str, help='Start date for data collection (YYYY-MM-DD)')
     parser.add_argument('--end-date', type=str, help='End date for data collection (YYYY-MM-DD)')
+    
+    # Multi-season collection options
+    parser.add_argument('--seasons', nargs='+', 
+                      help='Specific seasons to collect (e.g., 2021 2022 2023)')
+    parser.add_argument('--skip-existing', action='store_true',
+                      help='Skip seasons that already have data files')
+    
+    # Pipeline control options
     parser.add_argument('--skip-collection', action='store_true', help='Skip data collection step')
     parser.add_argument('--skip-preprocessing', action='store_true', help='Skip data preprocessing step')
     parser.add_argument('--skip-training', action='store_true', help='Skip model training step')
@@ -113,8 +123,21 @@ def main():
     
     # Step 1: Data Collection
     if not args.skip_collection:
-        # Create a modified data collection script with custom dates if provided
-        if args.start_date and args.end_date:
+        # Determine collection method
+        if args.seasons:
+            # Use multi-season collection
+            logger.info(f"Collecting data for multiple seasons: {', '.join(args.seasons)}")
+            collect_args = ['--seasons'] + args.seasons
+            if args.skip_existing:
+                collect_args.append('--skip-existing')
+            
+            result = run_script('src/collect_seasons.py', "Multi-Season Data Collection", collect_args)
+            if result != 0:
+                logger.error("Multi-season data collection failed, stopping pipeline")
+                return result
+        
+        elif args.start_date and args.end_date:
+            # Use custom date range for single-season collection
             logger.info(f"Setting custom date range: {args.start_date} to {args.end_date}")
             with open('src/data_collection.py', 'r') as f:
                 content = f.read()
@@ -132,15 +155,18 @@ def main():
             with open('src/data_collection_custom.py', 'w') as f:
                 f.write(content)
             
-            collection_script = 'src/data_collection_custom.py'
-        else:
-            collection_script = 'src/data_collection.py'
+            # Run custom data collection
+            result = run_script('src/data_collection_custom.py', "Custom Date Range Data Collection")
+            if result != 0:
+                logger.error("Data collection failed, stopping pipeline")
+                return result
         
-        # Run data collection
-        result = run_script(collection_script, "Data Collection")
-        if result != 0:
-            logger.error("Data collection failed, stopping pipeline")
-            return result
+        else:
+            # Use default season collection
+            result = run_script('src/data_collection.py', "Data Collection")
+            if result != 0:
+                logger.error("Data collection failed, stopping pipeline")
+                return result
     else:
         logger.info("Skipping data collection step")
     
@@ -165,7 +191,7 @@ def main():
     # Step 4: Run interactive prediction if requested
     if args.interactive:
         logger.info("Running interactive prediction")
-        command = ["python", "src/predict.py", "--interactive"]
+        command = [sys.executable, "src/predict.py", "--interactive"]
         subprocess.run(command)
     
     logger.info("Pipeline completed successfully!")
