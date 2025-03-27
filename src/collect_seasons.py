@@ -71,13 +71,41 @@ def collect_season_data(season, skip_existing=False):
     if not dates:
         logger.error(f"No date range defined for season {season}")
         raise ValueError(f"Unknown season: {season}")
-        
-    logger.info(f"Collecting data for season {season} from {dates['start']} to {dates['end']}")
-    season_data = collect_data_in_chunks(dates['start'], dates['end'], chunk_days=14)
     
-    # Save raw season data
+    logger.info(f"Collecting data for season {season} from {dates['start']} to {dates['end']}")
+    
+    # Initialize list to store successful chunks
+    successful_chunks = []
+    
+    try:
+        # Collect data in chunks
+        season_data = collect_data_in_chunks(dates['start'], dates['end'], chunk_days=14)
+        successful_chunks.append(season_data)
+    except Exception as e:
+        logger.error(f"Error during collection of season {season}: {str(e)}")
+        # Look for any partially collected chunks
+        chunk_pattern = os.path.join(RAW_DATA_DIR, f"statcast_*_{season}-*.csv")
+        chunk_files = glob.glob(chunk_pattern)
+        
+        if chunk_files:
+            logger.info(f"Found {len(chunk_files)} partial chunks for season {season}")
+            for chunk_file in chunk_files:
+                try:
+                    chunk_data = pd.read_csv(chunk_file)
+                    successful_chunks.append(chunk_data)
+                    logger.info(f"Loaded partial chunk from {chunk_file}")
+                except Exception as chunk_e:
+                    logger.error(f"Error loading chunk {chunk_file}: {str(chunk_e)}")
+    
+    if not successful_chunks:
+        raise ValueError(f"No data could be collected for season {season}")
+    
+    # Combine all successful chunks
+    season_data = pd.concat(successful_chunks, ignore_index=True)
+    
+    # Save combined season data
     season_data.to_csv(season_file, index=False)
-    logger.info(f"Season {season} data saved to {season_file}")
+    logger.info(f"Season {season} data saved to {season_file} ({len(season_data)} records)")
     
     return season_data
 
