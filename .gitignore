@@ -51,3 +51,5 @@ models/results/*.png
 # Custom exceptions (add files you want to keep)
 # Keep these specific files if needed
 # !data/processed/sample_data.csv
+# SQLite database
+data/*.db

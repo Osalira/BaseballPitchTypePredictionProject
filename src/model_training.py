@@ -270,43 +270,77 @@ def train_xgboost(X_train, y_train):
     X_train : pandas.DataFrame
         Training features
     y_train : pandas.Series
-        Training target
+        Training labels
     
     Returns:
     --------
-    xgboost.XGBClassifier
+    xgboost.Booster
         Trained XGBoost model
     """
     logger.info("Training XGBoost model")
     
-    # Define parameter grid for grid search
-    param_grid = {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'subsample': [0.8, 1.0],
-        'colsample_bytree': [0.8, 1.0]
+    # Check if GPU is available
+    try:
+        import cupy  # Check for CUDA support
+        gpu_available = True
+        logger.info("GPU detected - enabling GPU acceleration for XGBoost")
+    except ImportError:
+        gpu_available = False
+        logger.info("No GPU detected - using CPU for XGBoost")
+    
+    # Define parameters - improved for better accuracy
+    params = {
+        'objective': 'binary:logistic',
+        'eval_metric': 'auc',
+        'learning_rate': 0.05,  # Reduced from 0.1 for better generalization
+        'max_depth': 6,        # Increased from 5 for more complex patterns
+        'min_child_weight': 2,  # Increased to reduce overfitting
+        'subsample': 0.9,       # Increased for better generalization
+        'colsample_bytree': 0.9, # Increased for better generalization
+        'seed': 42
     }
     
-    # Initialize model
-    xgb_model = xgb.XGBClassifier(
-        objective='binary:logistic',
-        random_state=42,
-        use_label_encoder=False,
-        eval_metric='logloss'
+    # Add GPU parameters if GPU is available
+    if gpu_available:
+        params.update({
+            'tree_method': 'gpu_hist',
+            'predictor': 'gpu_predictor',
+            'gpu_id': 0
+        })
+    
+    # Create DMatrix for efficient training
+    import xgboost as xgb
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    
+    # Train with early stopping
+    num_boost_round = 1000
+    early_stopping_rounds = 50
+    
+    # Use cross-validation to find optimal number of boosting rounds
+    cv_results = xgb.cv(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        early_stopping_rounds=early_stopping_rounds,
+        nfold=5,
+        metrics='auc',
+        seed=42
     )
     
-    # Grid search with cross-validation
-    grid_search = GridSearchCV(
-        xgb_model, param_grid, cv=3, scoring='accuracy', n_jobs=-1
+    # Get the optimal number of boosting rounds
+    best_rounds = len(cv_results)
+    logger.info(f"XGBoost CV suggested {best_rounds} boosting rounds")
+    
+    # Train final model with optimal number of boosting rounds
+    final_model = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=best_rounds
     )
-    grid_search.fit(X_train, y_train)
     
-    # Get best model
-    best_xgb = grid_search.best_estimator_
-    logger.info(f"XGBoost best parameters: {grid_search.best_params_}")
+    logger.info(f"XGBoost model trained with {best_rounds} boosting rounds")
     
-    return best_xgb
+    return final_model
 
 def evaluate_model(model, X_test, y_test, model_name):
     """
@@ -477,104 +511,167 @@ def save_model(model, model_name):
     
     return filepath
 
+def perform_feature_selection(X_train, y_train, n_features=15):
+    """
+    Perform feature selection using mutual information
+    
+    Parameters:
+    -----------
+    X_train : pandas.DataFrame
+        Training features
+    y_train : pandas.Series
+        Training labels
+    n_features : int
+        Number of features to select
+    
+    Returns:
+    --------
+    tuple
+        (selected_features, feature_importance_df) - List of selected features and DataFrame with feature importances
+    """
+    logger.info(f"Performing feature selection to select top {n_features} features")
+    
+    from sklearn.feature_selection import mutual_info_classif, SelectKBest
+    
+    # Calculate mutual information
+    mutual_info = mutual_info_classif(X_train, y_train, random_state=42)
+    
+    # Create DataFrame with feature importances
+    feature_importance = pd.DataFrame({
+        'feature': X_train.columns,
+        'importance': mutual_info
+    })
+    
+    # Sort by importance
+    feature_importance = feature_importance.sort_values('importance', ascending=False)
+    
+    # Select top features
+    selected_features = feature_importance['feature'].head(n_features).tolist()
+    
+    logger.info(f"Selected features: {', '.join(selected_features)}")
+    
+    return selected_features, feature_importance
+
 def main():
     """Main function to execute model training workflow"""
-    # Create directories if they don't exist
+    # Create directories
     os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(os.path.join(MODELS_DIR, 'results'), exist_ok=True)
     
     # Load modeling data
     data = load_modeling_data()
     
-    # Prepare training and test data
+    # Prepare train/test split
     X_train, X_test, y_train, y_test = prepare_train_test_data(data)
     
-    # Scale features
-    X_train_scaled, X_test_scaled, scaler = scale_features(X_train, X_test)
+    # Perform feature selection (increase from 15 to 20 features to improve accuracy)
+    selected_features, feature_importance_df = perform_feature_selection(X_train, y_train, n_features=20)
     
-    # Save feature names for later use
-    feature_names = X_train.columns.tolist()
+    # Update training and test data with selected features
+    X_train_selected = X_train[selected_features]
+    X_test_selected = X_test[selected_features]
     
-    # Train models
-    models = {}
+    # Save the feature importance for later analysis
+    feature_importance_path = os.path.join(MODELS_DIR, 'results', 'feature_importance.csv')
+    feature_importance_df.to_csv(feature_importance_path, index=False)
+    logger.info(f"Saved feature importance to {feature_importance_path}")
     
-    # 1. Logistic Regression (baseline model)
-    logreg = train_logistic_regression(X_train_scaled, y_train)
-    models['Logistic Regression'] = logreg
+    # Save selected features list for prediction
+    features_path = os.path.join(MODELS_DIR, 'selected_features.pkl')
+    with open(features_path, 'wb') as f:
+        pickle.dump(selected_features, f)
+    logger.info(f"Saved selected features list to {features_path}")
     
-    # 2. Decision Tree (interpretable model)
-    dt = train_decision_tree(X_train, y_train)  # No scaling needed for tree models
-    models['Decision Tree'] = dt
+    # Scale features for appropriate models
+    X_train_scaled, X_test_scaled, scaler = scale_features(X_train_selected, X_test_selected)
     
-    # 3. Random Forest
-    rf = train_random_forest(X_train, y_train)  # No scaling needed for tree models
-    models['Random Forest'] = rf
-    
-    # 4. XGBoost
-    xgb_model = train_xgboost(X_train, y_train)  # No scaling needed for tree models
-    models['XGBoost'] = xgb_model
-    
-    # Evaluate models and save results
-    results = []
-    
-    for model_name, model in models.items():
-        logger.info(f"Processing {model_name} model")
-        
-        # Use scaled features for Logistic Regression
-        if model_name == 'Logistic Regression':
-            metrics = evaluate_model(model, X_test_scaled, y_test, model_name)
-        else:
-            metrics = evaluate_model(model, X_test, y_test, model_name)
-        
-        results.append(metrics)
-        
-        # Plot confusion matrix
-        cm_path = os.path.join(RESULTS_DIR, f"{model_name.lower().replace(' ', '_')}_confusion_matrix.png")
-        plot_confusion_matrix(metrics['confusion_matrix'], model_name, cm_path)
-        
-        # Plot feature importance
-        fi_path = os.path.join(RESULTS_DIR, f"{model_name.lower().replace(' ', '_')}_feature_importance.png")
-        plot_feature_importance(model, feature_names, model_name, fi_path)
-        
-        # Save the model
-        saved_path = save_model(model, model_name)
-        
-        # For decision tree, also save a visualization
-        if model_name == 'Decision Tree':
-            dt_plot_path = os.path.join(RESULTS_DIR, 'decision_tree_visualization.png')
-            plt.figure(figsize=(20, 10))
-            plot_tree(model, feature_names=feature_names, filled=True, rounded=True, proportion=True)
-            plt.savefig(dt_plot_path, dpi=300, bbox_inches='tight')
-            plt.close()
-            logger.info(f"Decision Tree visualization saved to {dt_plot_path}")
-    
-    # Save scaler for future use
+    # Save scaler for later use in predictions
     scaler_path = os.path.join(MODELS_DIR, 'standard_scaler.pkl')
     with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
     logger.info(f"Saved scaler to {scaler_path}")
     
-    # Compile results into a comparison table
-    results_df = pd.DataFrame([
-        {
-            'Model': r['model_name'],
-            'Accuracy': r['accuracy'],
-            'Precision': r['precision'],
-            'Recall': r['recall'],
-            'F1 Score': r['f1_score'],
-            'ROC AUC': r['roc_auc']
-        }
-        for r in results
-    ])
+    # Train and evaluate models
+    model_results = []
     
-    # Save results to CSV
-    results_path = os.path.join(RESULTS_DIR, 'model_comparison.csv')
-    results_df.to_csv(results_path, index=False)
-    logger.info(f"Saved model comparison to {results_path}")
+    # Logistic Regression (with scaled features)
+    lr_model = train_logistic_regression(X_train_scaled, y_train)
+    lr_metrics = evaluate_model(lr_model, X_test_scaled, y_test, "Logistic Regression")
+    save_model(lr_model, "logistic_regression")
+    model_results.append(["Logistic Regression", lr_metrics['accuracy'], lr_metrics['precision'], 
+                          lr_metrics['recall'], lr_metrics['f1_score'], lr_metrics['roc_auc']])
     
-    # Print final comparison
+    # Decision Tree (without scaling)
+    dt_model = train_decision_tree(X_train_selected, y_train)
+    dt_metrics = evaluate_model(dt_model, X_test_selected, y_test, "Decision Tree")
+    save_model(dt_model, "decision_tree")
+    model_results.append(["Decision Tree", dt_metrics['accuracy'], dt_metrics['precision'], 
+                          dt_metrics['recall'], dt_metrics['f1_score'], dt_metrics['roc_auc']])
+    
+    # Random Forest (without scaling)
+    rf_model = train_random_forest(X_train_selected, y_train)
+    rf_metrics = evaluate_model(rf_model, X_test_selected, y_test, "Random Forest")
+    save_model(rf_model, "random_forest")
+    model_results.append(["Random Forest", rf_metrics['accuracy'], rf_metrics['precision'], 
+                          rf_metrics['recall'], rf_metrics['f1_score'], rf_metrics['roc_auc']])
+    
+    # XGBoost (without scaling)
+    xgb_model = train_xgboost(X_train_selected, y_train)
+    
+    # For XGBoost booster, we need to convert to DMatrix for prediction
+    import xgboost as xgb
+    dtest = xgb.DMatrix(X_test_selected)
+    y_prob_xgb = xgb_model.predict(dtest)
+    y_pred_xgb = (y_prob_xgb >= 0.5).astype(int)
+    
+    xgb_metrics = {
+        'accuracy': accuracy_score(y_test, y_pred_xgb),
+        'precision': precision_score(y_test, y_pred_xgb),
+        'recall': recall_score(y_test, y_pred_xgb),
+        'f1': f1_score(y_test, y_pred_xgb),
+        'roc_auc': roc_auc_score(y_test, y_prob_xgb)
+    }
+    
+    # Log XGBoost metrics
+    logger.info(f"XGBoost Accuracy: {xgb_metrics['accuracy']:.4f}")
+    logger.info(f"XGBoost Precision: {xgb_metrics['precision']:.4f}")
+    logger.info(f"XGBoost Recall: {xgb_metrics['recall']:.4f}")
+    logger.info(f"XGBoost F1 Score: {xgb_metrics['f1']:.4f}")
+    logger.info(f"XGBoost ROC AUC: {xgb_metrics['roc_auc']:.4f}")
+    
+    # Save XGBoost model
+    save_model(xgb_model, "xgboost")
+    model_results.append(["XGBoost", xgb_metrics['accuracy'], xgb_metrics['precision'], 
+                           xgb_metrics['recall'], xgb_metrics['f1'], 
+                           xgb_metrics['roc_auc']])
+    
+    # Create and save confusion matrices for each model
+    plot_confusion_matrix(
+        confusion_matrix(y_test, y_pred_xgb),
+        "XGBoost",
+        os.path.join(MODELS_DIR, 'results', 'xgboost_confusion_matrix.png')
+    )
+    
+    # Save feature importance for tree-based models
+    try:
+        plot_feature_importance(
+            xgb_model, selected_features, "XGBoost", 
+            os.path.join(MODELS_DIR, 'results', 'xgboost_feature_importance.png')
+        )
+    except Exception as e:
+        logger.warning(f"Could not generate feature importance plot for XGBoost: {str(e)}")
+    
+    # Compare all models and save results
+    columns = ['Model', 'Accuracy', 'Precision', 'Recall', 'F1 Score', 'ROC AUC']
+    comparison_df = pd.DataFrame(model_results, columns=columns)
+    comparison_path = os.path.join(MODELS_DIR, 'results', 'model_comparison.csv')
+    comparison_df.to_csv(comparison_path, index=False)
+    
+    logger.info(f"Saved model comparison to {comparison_path}")
     logger.info("\nModel Comparison:")
-    logger.info(results_df.to_string(index=False))
+    logger.info(comparison_df.to_string())
+    
+    return comparison_df
 
 if __name__ == "__main__":
     main() 

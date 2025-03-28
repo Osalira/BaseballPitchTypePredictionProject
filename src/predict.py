@@ -39,7 +39,7 @@ def load_latest_model(model_type='xgboost'):
     Returns:
     --------
     tuple
-        (model, scaler) - The loaded model and scaler
+        (model, scaler, selected_features) - The loaded model, scaler, and list of selected features
     """
     # Normalize model_type for filename matching
     model_type = model_type.lower().replace(' ', '_')
@@ -70,9 +70,19 @@ def load_latest_model(model_type='xgboost'):
         else:
             logger.warning("No scaler found, but model requires scaling. Results may be inaccurate.")
     
-    return model, scaler
+    # Load selected features list if available
+    selected_features = None
+    features_path = os.path.join(MODELS_DIR, 'selected_features.pkl')
+    if os.path.exists(features_path):
+        with open(features_path, 'rb') as f:
+            selected_features = pickle.load(f)
+        logger.info(f"Loaded {len(selected_features)} selected features")
+    else:
+        logger.warning("No selected features list found. Using all available features.")
+    
+    return model, scaler, selected_features
 
-def prepare_input_features(feature_values):
+def prepare_input_features(feature_values, selected_features=None):
     """
     Prepare input features for prediction
     
@@ -80,6 +90,8 @@ def prepare_input_features(feature_values):
     -----------
     feature_values : dict
         Dictionary with feature names and values
+    selected_features : list, optional
+        List of selected features to use. If provided, only these features will be used.
     
     Returns:
     --------
@@ -94,6 +106,21 @@ def prepare_input_features(feature_values):
         if pd.isna(df[col]).any():
             logger.warning(f"Missing value for feature: {col}. Using 0 as default.")
             df[col] = df[col].fillna(0)
+    
+    # If we have a list of selected features, ensure we only use those
+    if selected_features is not None:
+        # Create a new DataFrame with only the selected features
+        selected_df = pd.DataFrame(index=df.index)
+        
+        # Fill in the selected features
+        for feature in selected_features:
+            if feature in df.columns:
+                selected_df[feature] = df[feature]
+            else:
+                logger.warning(f"Missing expected feature: {feature}. Using 0 as default.")
+                selected_df[feature] = 0
+        
+        return selected_df
     
     return df
 
@@ -115,24 +142,60 @@ def predict_pitch_type(model, features, scaler=None):
     tuple
         (prediction, probability) - Predicted class and confidence
     """
-    # Scale features if scaler is provided
-    if scaler is not None:
-        features_scaled = scaler.transform(features)
-        features_to_use = pd.DataFrame(features_scaled, columns=features.columns)
-    else:
-        features_to_use = features
-    
-    # Make prediction
-    prediction = model.predict(features_to_use)[0]
-    
-    # Get probability if available
-    if hasattr(model, 'predict_proba'):
-        probabilities = model.predict_proba(features_to_use)[0]
-        probability = probabilities[1] if prediction == 1 else probabilities[0]
-    else:
-        probability = None
-    
-    return prediction, probability
+    try:
+        # Scale features if scaler is provided
+        if scaler is not None:
+            features_scaled = scaler.transform(features)
+            features_to_use = pd.DataFrame(features_scaled, columns=features.columns)
+        else:
+            features_to_use = features
+        
+        # Check model type to use appropriate prediction method
+        if str(type(model)).find('xgboost') != -1:
+            try:
+                # XGBoost native model requires DMatrix format
+                import xgboost as xgb
+                
+                # Log the feature names for debugging
+                logger.info(f"Making prediction with {len(features_to_use.columns)} features: {features_to_use.columns.tolist()}")
+                
+                dtest = xgb.DMatrix(features_to_use)
+                probabilities = model.predict(dtest)
+                prediction = (probabilities >= 0.5).astype(int)
+                probability = probabilities[0] if prediction[0] == 1 else 1 - probabilities[0]
+                return prediction[0], probability
+            except Exception as e:
+                logger.error(f"Error in XGBoost prediction: {str(e)}")
+                raise
+        else:
+            # For scikit-learn models (Logistic Regression, Decision Tree, Random Forest)
+            prediction = model.predict(features_to_use)[0]
+            
+            # Get probability if available
+            if hasattr(model, 'predict_proba'):
+                probabilities = model.predict_proba(features_to_use)[0]
+                probability = probabilities[1] if prediction == 1 else probabilities[0]
+            else:
+                probability = None
+            
+            return prediction, probability
+    except Exception as e:
+        logger.error(f"Error during prediction: {str(e)}")
+        # Fallback to a simpler prediction
+        if "feature_names mismatch" in str(e) and isinstance(model, object) and hasattr(model, 'best_iteration'):
+            logger.warning("Attempting prediction without feature names validation")
+            try:
+                import xgboost as xgb
+                # Try again without feature names validation
+                dtest = xgb.DMatrix(features.values, feature_names=None)
+                probabilities = model.predict(dtest)
+                prediction = (probabilities >= 0.5).astype(int)
+                probability = probabilities[0] if prediction[0] == 1 else 1 - probabilities[0]
+                return prediction[0], probability
+            except Exception as fallback_e:
+                logger.error(f"Fallback prediction also failed: {str(fallback_e)}")
+                raise
+        raise
 
 def get_pitch_category(prediction):
     """
@@ -166,8 +229,11 @@ def interactive_prediction():
     model_type = model_choices[int(choice) - 1] if choice and choice.isdigit() and 1 <= int(choice) <= 4 else model_choices[0]
     
     try:
-        model, scaler = load_latest_model(model_type)
+        model, scaler, selected_features = load_latest_model(model_type)
         print(f"\nLoaded {model_type.replace('_', ' ').title()} model successfully.")
+        
+        if selected_features:
+            print(f"Model expects {len(selected_features)} specific features.")
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         return
@@ -203,13 +269,32 @@ def interactive_prediction():
         print("\nPitcher Information:")
         features['pitcher_fb_pct'] = float(input("Pitcher's fastball percentage (0-1): ").strip() or "0.6")
         features['pitcher_count_fb_pct'] = float(input(f"Pitcher's fastball percentage in {count} count (0-1): ").strip() or "0.6")
-        features['pitcher_hitter_count_fb_pct'] = float(input("Pitcher's fastball percentage in current count type (0-1): ").strip() or "0.6")
+        
+        # Add count-specific tendencies (these were missing from the original script)
+        if features['hitter_count'] == 1:
+            features['pitcher_hitter_count_fb_pct'] = float(input("Pitcher's fastball percentage in hitter counts (0-1): ").strip() or "0.5")
+        else:
+            features['pitcher_hitter_count_fb_pct'] = 0.0
+            
+        if features['pitcher_count'] == 1:
+            features['pitcher_pitcher_count_fb_pct'] = float(input("Pitcher's fastball percentage in pitcher counts (0-1): ").strip() or "0.7")
+        else:
+            features['pitcher_pitcher_count_fb_pct'] = 0.0
+            
+        if features['neutral_count'] == 1:
+            features['pitcher_neutral_count_fb_pct'] = float(input("Pitcher's fastball percentage in neutral counts (0-1): ").strip() or "0.6")
+        else:
+            features['pitcher_neutral_count_fb_pct'] = 0.0
         
         # Catcher tendencies (if available)
-        include_catcher = input("\nInclude catcher information? (y/n) [default=n]: ").strip().lower() == 'y'
+        include_catcher = input("\nInclude catcher information? (y/n) [default=y]: ").strip().lower() != 'n'
         if include_catcher:
             features['catcher_fb_pct'] = float(input("Catcher's fastball percentage (0-1): ").strip() or "0.6")
             features['catcher_count_fb_pct'] = float(input(f"Catcher's fastball percentage in {count} count (0-1): ").strip() or "0.6")
+        else:
+            # Add default values even if not collecting catcher info
+            features['catcher_fb_pct'] = 0.6
+            features['catcher_count_fb_pct'] = 0.6
         
         # Batter tendencies
         print("\nBatter Information:")
@@ -233,17 +318,21 @@ def interactive_prediction():
             features['consecutive_counter'] = 0
         
         # Prepare features for prediction
-        input_features = prepare_input_features(features)
+        input_features = prepare_input_features(features, selected_features)
         
         # Make prediction
-        prediction, probability = predict_pitch_type(model, input_features, scaler)
-        pitch_category = get_pitch_category(prediction)
-        
-        # Display result
-        print("\n=== Prediction Result ===")
-        print(f"Next pitch prediction: {pitch_category}")
-        if probability is not None:
-            print(f"Confidence: {probability:.2%}")
+        try:
+            prediction, probability = predict_pitch_type(model, input_features, scaler)
+            pitch_category = get_pitch_category(prediction)
+            
+            # Display result
+            print("\n=== Prediction Result ===")
+            print(f"Next pitch prediction: {pitch_category}")
+            if probability is not None:
+                print(f"Confidence: {probability:.2%}")
+        except Exception as e:
+            print(f"\nError making prediction: {str(e)}")
+            print("Please try a different model or check the required features.")
         
         # Ask if user wants to make another prediction
         if input("\nMake another prediction? (y/n) [default=y]: ").strip().lower() == 'n':
@@ -261,7 +350,7 @@ def predict_from_command_line(args):
         Command line arguments
     """
     # Load model
-    model, scaler = load_latest_model(args.model_type)
+    model, scaler, selected_features = load_latest_model(args.model_type)
     
     # Prepare features
     features = {
@@ -299,7 +388,7 @@ def predict_from_command_line(args):
     features['batter_fb_os_diff'] = args.batter_vs_fb - args.batter_vs_os
     
     # Prepare features for prediction
-    input_features = prepare_input_features(features)
+    input_features = prepare_input_features(features, selected_features)
     
     # Make prediction
     prediction, probability = predict_pitch_type(model, input_features, scaler)

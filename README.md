@@ -26,6 +26,26 @@ This project aims to develop a machine learning model capable of predicting the 
    python src/data_collection.py
    ```
 
+## Database Setup
+
+For optimized performance, the project uses an SQLite database to store and process baseball data efficiently:
+
+1. Initialize the database structure:
+   ```
+   python setup_database.py
+   ```
+
+2. This creates a `data/baseball.db` file with tables for:
+   - Metadata tracking
+   - Optimized indices for faster queries
+   - Firebase synchronization tracking (for optional web frontend)
+
+3. The database enables:
+   - Faster data loading and processing
+   - Reduced memory usage during preprocessing
+   - Better handling of large multi-season datasets
+   - Integration with web frontends through Firebase
+
 ## Multi-Season Training
 
 This project supports training with data from multiple MLB seasons to improve model accuracy:
