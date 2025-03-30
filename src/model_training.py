@@ -67,7 +67,191 @@ def load_modeling_data():
     data = pd.read_csv(most_recent_file)
     logger.info(f"Loaded {len(data)} samples with {len(data.columns)} columns")
     
+    # Incorporate user feedback data if available
+    user_feedback_data = load_feedback_data()
+    if not user_feedback_data.empty:
+        data = incorporate_feedback_data(data, user_feedback_data)
+    
     return data
+
+def load_feedback_data():
+    """
+    Load user feedback data from the SQLite database
+    
+    Returns:
+    --------
+    pandas.DataFrame
+        User feedback data
+    """
+    import sqlite3
+    from utils import get_db_path
+    
+    DB_PATH = get_db_path()
+    logger.info(f"Loading user feedback from SQLite database at {DB_PATH}")
+    
+    try:
+        # Connect to SQLite
+        conn = sqlite3.connect(DB_PATH)
+        
+        # Check if predictions table exists
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='predictions'")
+        if not cursor.fetchone():
+            logger.warning("Predictions table not found in SQLite")
+            return pd.DataFrame()
+        
+        # Check if actual_pitch column exists
+        cursor.execute("PRAGMA table_info(predictions)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'actual_pitch' not in columns or 'was_correct' not in columns:
+            logger.warning("Actual pitch data not found in predictions table")
+            return pd.DataFrame()
+        
+        # Query predictions with actual outcomes recorded
+        feedback_data = pd.read_sql_query(
+            """
+            SELECT * FROM predictions 
+            WHERE actual_pitch IS NOT NULL
+            """, 
+            conn
+        )
+        conn.close()
+        
+        if feedback_data.empty:
+            logger.info("No user feedback available for training")
+            return pd.DataFrame()
+        
+        logger.info(f"Loaded {len(feedback_data)} records of user feedback")
+        return feedback_data
+        
+    except Exception as e:
+        logger.error(f"Error loading user feedback: {str(e)}")
+        return pd.DataFrame()
+
+def incorporate_feedback_data(modeling_data, feedback_data):
+    """
+    Incorporate user feedback into the modeling dataset
+    
+    Parameters:
+    -----------
+    modeling_data : pandas.DataFrame
+        The original modeling dataset
+    feedback_data : pandas.DataFrame
+        User feedback data
+        
+    Returns:
+    --------
+    pandas.DataFrame
+        Updated modeling dataset with user feedback
+    """
+    logger.info("Incorporating user feedback into modeling dataset")
+    
+    # Create a copy of the modeling data
+    updated_data = modeling_data.copy()
+    
+    try:
+        # Create a new dataframe with the same structure as modeling_data
+        feedback_modeling = pd.DataFrame(columns=modeling_data.columns)
+        
+        # Map actual_pitch in feedback to is_fastball (binary target)
+        fastball_types = ['FF', 'FT', 'FC', 'SI', 'FS']  # Common fastball codes
+        
+        for _, feedback in feedback_data.iterrows():
+            # Extract game state features
+            game_state = feedback.get('gameState', {})
+            if isinstance(game_state, str):
+                import json
+                game_state = json.loads(game_state)
+                
+            # Extract pitcher and batter info
+            pitcher_info = feedback.get('pitcherInfo', {})
+            batter_info = feedback.get('batterInfo', {})
+            
+            if isinstance(pitcher_info, str):
+                import json
+                pitcher_info = json.loads(pitcher_info)
+                
+            if isinstance(batter_info, str):
+                import json
+                batter_info = json.loads(batter_info)
+                
+            # Create a new row
+            new_row = {}
+            
+            # Fill in features from the feedback data
+            # Game situation
+            new_row['balls'] = game_state.get('balls', 0)
+            new_row['strikes'] = game_state.get('strikes', 0)
+            new_row['outs_when_up'] = game_state.get('outs', 0)
+            new_row['inning'] = game_state.get('inning', 1)
+            
+            # Count type indicators
+            count_type = game_state.get('countType', 'Neutral')
+            new_row['hitter_count'] = 1 if count_type == 'Hitter' else 0
+            new_row['pitcher_count'] = 1 if count_type == 'Pitcher' else 0
+            new_row['neutral_count'] = 1 if count_type == 'Neutral' else 0
+            
+            # Inning stage indicators
+            inning_stage = game_state.get('inningStage', 'Early')
+            new_row['early_inning'] = 1 if inning_stage == 'Early' else 0
+            new_row['middle_inning'] = 1 if inning_stage == 'Middle' else 0
+            new_row['late_inning'] = 1 if inning_stage == 'Late' else 0
+            
+            # Pitcher tendencies
+            new_row['pitcher_fb_pct'] = pitcher_info.get('fastballPercentage', 0.5)
+            new_row['pitcher_count_fb_pct'] = pitcher_info.get('countFastballPercentage', 0.5)
+            
+            # Set the target variable based on the actual pitch outcome
+            actual_pitch = feedback.get('actualPitch', '')
+            new_row['is_fastball'] = 1 if actual_pitch in fastball_types else 0
+            
+            # Add other available features
+            # Only include columns that exist in the modeling dataset
+            for col in modeling_data.columns:
+                if col not in new_row and col in feedback_data.columns:
+                    new_row[col] = feedback[col]
+            
+            # Add the new row to the feedback modeling data
+            feedback_row = pd.DataFrame([new_row])
+            feedback_row = feedback_row.reindex(columns=modeling_data.columns)
+            feedback_modeling = pd.concat([feedback_modeling, feedback_row], ignore_index=True)
+        
+        # Remove columns with all NaN values
+        feedback_modeling = feedback_modeling.dropna(axis=1, how='all')
+        
+        # Fill remaining NaN values with sensible defaults or column means from original data
+        for col in feedback_modeling.columns:
+            if feedback_modeling[col].isna().all():
+                if col in modeling_data.columns:
+                    feedback_modeling[col] = modeling_data[col].mean()
+                else:
+                    feedback_modeling[col] = 0
+        
+        # Add feedback data to the modeling dataset
+        if not feedback_modeling.empty:
+            # Check if we need to add missing columns
+            for col in modeling_data.columns:
+                if col not in feedback_modeling.columns:
+                    feedback_modeling[col] = modeling_data[col].iloc[0]
+            
+            # Reorder columns to match original data
+            feedback_modeling = feedback_modeling[modeling_data.columns]
+            
+            # Combine the datasets, giving more weight to feedback data
+            # Duplicate feedback data to increase its influence on the model
+            weight_factor = 2  # Adjust as needed
+            weighted_feedback = pd.concat([feedback_modeling] * weight_factor, ignore_index=True)
+            updated_data = pd.concat([modeling_data, weighted_feedback], ignore_index=True)
+            
+            logger.info(f"Added {len(feedback_modeling)} feedback records with weight factor {weight_factor}")
+            logger.info(f"Updated modeling data now has {len(updated_data)} records")
+    
+    except Exception as e:
+        logger.error(f"Error incorporating feedback data: {str(e)}")
+        logger.warning("Using original modeling data without feedback")
+        return modeling_data
+    
+    return updated_data
 
 def prepare_train_test_data(data, test_size=0.2, random_state=42):
     """

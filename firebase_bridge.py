@@ -2,8 +2,8 @@
 """
 Firebase Bridge for Baseball Pitch Prediction
 
-This script syncs essential data between SQLite database and Firebase,
-implementing the hybrid approach for optimal performance and accessibility.
+This script synchronizes data between the SQLite database and Firebase Firestore,
+making prediction results and analysis available for the frontend application.
 """
 
 import os
@@ -11,7 +11,20 @@ import json
 import sqlite3
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
+from dotenv import load_dotenv
+import uuid  # For generating unique IDs if needed
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Firebase admin imports
+try:
+    import firebase_admin
+    from firebase_admin import credentials
+    from firebase_admin import firestore
+except ImportError:
+    logging.warning("Firebase admin SDK not installed. Run: pip install firebase-admin")
 
 # Configure logging
 logging.basicConfig(
@@ -24,52 +37,65 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.path.join('data', 'baseball.db')
 
 # Firebase configuration
-# Note: You'll need to add your Firebase config here
-# and install firebase-admin package (pip install firebase-admin)
-FIREBASE_CONFIG = {
-    # Add your Firebase configuration here
-    # 'apiKey': 'YOUR_API_KEY',
-    # 'authDomain': 'YOUR_PROJECT_ID.firebaseapp.com',
-    # 'databaseURL': 'https://YOUR_PROJECT_ID.firebaseio.com',
-    # 'projectId': 'YOUR_PROJECT_ID',
-    # 'storageBucket': 'YOUR_PROJECT_ID.appspot.com',
-    # 'messagingSenderId': 'YOUR_MESSAGING_SENDER_ID',
-    # 'appId': 'YOUR_APP_ID'
-}
+FIREBASE_CONFIG_PATH = 'firebase-config.json'
 
 def initialize_firebase():
     """
-    Initialize Firebase connection
+    Initialize Firebase connection using service account credentials from firebase-config.json
     
     Returns:
     --------
-    firebase_admin.db
-        Firebase database reference
+    firestore.Client
+        Firestore database client
     """
     try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
+        # Check if already initialized
+        if firebase_admin._apps:
+            logger.info("Firebase already initialized")
+            return firebase_admin.get_app()
         
-        # Check if app is already initialized
-        if not firebase_admin._apps:
-            # Initialize the app
-            cred = credentials.Certificate("firebase-key.json")  # You'll need to create this file
-            firebase_admin.initialize_app(cred)
+        # Check if service account file exists
+        if not os.path.exists(FIREBASE_CONFIG_PATH):
+            logger.error(f"Firebase config file not found at {FIREBASE_CONFIG_PATH}")
+            logger.info("Please ensure your firebase-config.json file is in the project root directory")
+            
+            # Fall back to environment variables if service account file doesn't exist
+            firebase_config = {
+                "projectId": os.getenv('VITE_FIREBASE_PROJECT_ID')
+            }
+            
+            if not firebase_config["projectId"]:
+                logger.error("Required Firebase environment variables not found in .env file")
+                return None
+            
+            # Initialize without credentials (relies on environment variables)
+            try:
+                firebase_admin.initialize_app()
+                logger.info("Firebase initialized using environment variables (limited functionality)")
+            except Exception as e:
+                logger.error(f"Error initializing Firebase with environment vars: {str(e)}")
+                return None
+        else:
+            # Initialize with service account credentials
+            try:
+                cred = credentials.Certificate(FIREBASE_CONFIG_PATH)
+                firebase_admin.initialize_app(cred)
+                logger.info("Firebase initialized with service account credentials from firebase-config.json")
+            except Exception as e:
+                logger.error(f"Error initializing Firebase with service account: {str(e)}")
+                return None
         
-        # Get Firestore database
+        # Get Firestore client
         db = firestore.client()
-        logger.info("Firebase connection initialized")
         return db
-    except ImportError:
-        logger.error("Firebase admin SDK not installed. Run: pip install firebase-admin")
-        return None
+    
     except Exception as e:
         logger.error(f"Error initializing Firebase: {str(e)}")
         return None
 
 def get_model_results():
     """
-    Get model results from SQLite database
+    Get model comparison results from SQLite
     
     Returns:
     --------
@@ -77,34 +103,47 @@ def get_model_results():
         Model comparison results
     """
     try:
+        # Connect to SQLite
         conn = sqlite3.connect(DB_PATH)
         
-        # Check if model results table exists
+        # Check if table exists
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='model_comparison'")
-        if cursor.fetchone() is None:
-            # Try to read from CSV file
-            results_path = os.path.join('models', 'results', 'model_comparison.csv')
-            if os.path.exists(results_path):
-                results = pd.read_csv(results_path)
-                # Save to SQLite for future access
-                results.to_sql('model_comparison', conn, if_exists='replace', index=False)
+        if not cursor.fetchone():
+            logger.info("Model comparison table not found in SQLite, trying CSV file")
+            csv_path = os.path.join('models', 'results', 'model_comparison.csv')
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                logger.info(f"Loaded model comparison from {csv_path}")
+                
+                # Ensure there's an ID column
+                if 'id' not in df.columns:
+                    logger.info("Adding ID column to model comparison data")
+                    df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
+                
+                return df
             else:
-                logger.error("No model comparison results found")
-                return None
-        else:
-            # Read from SQLite
-            results = pd.read_sql_query("SELECT * FROM model_comparison", conn)
+                logger.warning("No model comparison data found")
+                return pd.DataFrame()
         
+        # Query from SQLite
+        df = pd.read_sql_query("SELECT * FROM model_comparison", conn)
         conn.close()
-        return results
+        
+        # Ensure there's an ID column
+        if 'id' not in df.columns:
+            logger.info("Adding ID column to model comparison data")
+            df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
+        
+        return df
+    
     except Exception as e:
         logger.error(f"Error getting model results: {str(e)}")
-        return None
+        return pd.DataFrame()
 
 def get_features_importance():
     """
-    Get feature importance from SQLite database
+    Get feature importance data from SQLite
     
     Returns:
     --------
@@ -112,194 +151,273 @@ def get_features_importance():
         Feature importance data
     """
     try:
+        # Connect to SQLite
         conn = sqlite3.connect(DB_PATH)
         
-        # Check if feature importance table exists
+        # Check if table exists
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feature_importance'")
-        if cursor.fetchone() is None:
-            # Try to read from CSV file
-            fi_path = os.path.join('models', 'results', 'feature_importance.csv')
-            if os.path.exists(fi_path):
-                fi_data = pd.read_csv(fi_path)
-                # Save to SQLite for future access
-                fi_data.to_sql('feature_importance', conn, if_exists='replace', index=False)
+        if not cursor.fetchone():
+            logger.info("Feature importance table not found in SQLite, trying CSV file")
+            csv_path = os.path.join('models', 'results', 'feature_importance.csv')
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                logger.info(f"Loaded feature importance from {csv_path}")
+                return df
             else:
-                logger.error("No feature importance data found")
-                return None
-        else:
-            # Read from SQLite
-            fi_data = pd.read_sql_query("SELECT * FROM feature_importance", conn)
+                logger.warning("No feature importance data found")
+                return pd.DataFrame()
         
+        # Query from SQLite
+        df = pd.read_sql_query("SELECT * FROM feature_importance", conn)
         conn.close()
-        return fi_data
+        
+        return df
+    
     except Exception as e:
         logger.error(f"Error getting feature importance: {str(e)}")
-        return None
+        return pd.DataFrame()
 
 def get_recent_predictions(limit=100):
     """
-    Get recent predictions from SQLite database
+    Get recent predictions from SQLite
     
     Parameters:
     -----------
     limit : int
-        Maximum number of predictions to return
+        Maximum number of predictions to retrieve
     
     Returns:
     --------
     pandas.DataFrame
-        Recent predictions
+        Recent predictions data
     """
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        
-        # Check if predictions table exists
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='predictions'")
-        if cursor.fetchone() is None:
-            # No predictions found
-            logger.warning("No predictions table found")
-            return None
-        
-        # Get recent predictions
-        predictions = pd.read_sql_query(
-            f"SELECT * FROM predictions ORDER BY timestamp DESC LIMIT {limit}",
-            conn
-        )
-        
-        conn.close()
-        return predictions
-    except Exception as e:
-        logger.error(f"Error getting recent predictions: {str(e)}")
-        return None
-
-def sync_to_firebase():
-    """
-    Sync data from SQLite to Firebase
-    """
-    # Initialize Firebase
-    db = initialize_firebase()
-    if db is None:
-        return
-    
     try:
         # Connect to SQLite
         conn = sqlite3.connect(DB_PATH)
+        
+        # Check if table exists
         cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='predictions'")
+        if not cursor.fetchone():
+            logger.warning("Predictions table not found in SQLite")
+            return pd.DataFrame()
         
-        # 1. Sync model results
-        model_results = get_model_results()
-        if model_results is not None:
-            # Convert to dictionary for Firebase
-            models_data = model_results.to_dict(orient='records')
-            
-            # Save to Firebase
-            db.collection('model_results').document('comparison').set({
-                'data': models_data,
-                'last_updated': datetime.now(),
-                'count': len(models_data)
-            })
-            logger.info(f"Synced {len(models_data)} model results to Firebase")
-            
-            # Update sync status in SQLite
-            cursor.execute(
-                "INSERT OR REPLACE INTO firebase_sync (table_name, last_sync, record_count, status) VALUES (?, ?, ?, ?)",
-                ('model_comparison', datetime.now().isoformat(), len(models_data), 'success')
-            )
-        
-        # 2. Sync feature importance
-        feature_importance = get_features_importance()
-        if feature_importance is not None:
-            # Convert to dictionary for Firebase
-            fi_data = feature_importance.to_dict(orient='records')
-            
-            # Save to Firebase
-            db.collection('model_results').document('feature_importance').set({
-                'data': fi_data,
-                'last_updated': datetime.now(),
-                'count': len(fi_data)
-            })
-            logger.info(f"Synced {len(fi_data)} feature importance records to Firebase")
-            
-            # Update sync status in SQLite
-            cursor.execute(
-                "INSERT OR REPLACE INTO firebase_sync (table_name, last_sync, record_count, status) VALUES (?, ?, ?, ?)",
-                ('feature_importance', datetime.now().isoformat(), len(fi_data), 'success')
-            )
-        
-        # 3. Sync recent predictions
-        predictions = get_recent_predictions(limit=100)
-        if predictions is not None:
-            # Convert to dictionary for Firebase
-            pred_data = predictions.to_dict(orient='records')
-            
-            # Save to Firebase
-            db.collection('predictions').document('recent').set({
-                'data': pred_data,
-                'last_updated': datetime.now(),
-                'count': len(pred_data)
-            })
-            logger.info(f"Synced {len(pred_data)} recent predictions to Firebase")
-            
-            # Update sync status in SQLite
-            cursor.execute(
-                "INSERT OR REPLACE INTO firebase_sync (table_name, last_sync, record_count, status) VALUES (?, ?, ?, ?)",
-                ('predictions', datetime.now().isoformat(), len(pred_data), 'success')
-            )
-        
-        # 4. Sync metadata about available seasons
-        cursor.execute("SELECT DISTINCT value FROM metadata WHERE key LIKE 'season_%'")
-        seasons = [row[0] for row in cursor.fetchall()]
-        
-        if seasons:
-            db.collection('metadata').document('seasons').set({
-                'available_seasons': seasons,
-                'last_updated': datetime.now()
-            })
-            logger.info(f"Synced metadata about {len(seasons)} available seasons")
-        
-        # Commit SQLite changes
-        conn.commit()
+        # Query from SQLite
+        df = pd.read_sql_query(
+            f"SELECT * FROM predictions ORDER BY timestamp DESC LIMIT {limit}", 
+            conn
+        )
         conn.close()
         
-        logger.info("Firebase sync completed successfully")
+        # Ensure there's an ID column
+        if not df.empty and 'id' not in df.columns:
+            logger.info("Adding ID column to predictions data")
+            df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
         
+        return df
+    
     except Exception as e:
-        logger.error(f"Error syncing to Firebase: {str(e)}")
+        logger.error(f"Error getting recent predictions: {str(e)}")
+        return pd.DataFrame()
+
+def sync_to_firebase():
+    """
+    Synchronize data from SQLite to Firebase Firestore.
+    This ensures that the frontend and backend data stays consistent.
+    """
+    db = sqlite3.connect(DB_PATH)
+    firebase_app = initialize_firebase()
+    db_firestore = firestore.client(firebase_app)
+    
+    # Sync model results to Firestore
+    try:
+        model_results = get_model_results()
+        if not model_results.empty:
+            # Check if 'id' column exists, add it if it doesn't
+            if 'id' not in model_results.columns:
+                logger.warning("No 'id' column found in model results. Adding generated IDs.")
+                model_results['id'] = [str(uuid.uuid4()) for _ in range(len(model_results))]
+            
+            results_collection = db_firestore.collection('model_results')
+            
+            # Check which results already exist in Firestore
+            existing_results = []
+            docs = results_collection.stream()
+            for doc in docs:
+                result_data = doc.to_dict()
+                if 'id' in result_data:
+                    existing_results.append(result_data['id'])
+            
+            # Add any new results
+            for index, result in model_results.iterrows():
+                try:
+                    # First convert the Series to a dictionary
+                    result_dict = result.to_dict()
+                    
+                    # Check if ID exists in the dictionary
+                    if 'id' not in result_dict:
+                        result_dict['id'] = str(uuid.uuid4())
+                    
+                    result_id = result_dict['id']
+                    if result_id not in existing_results:
+                        # Add to Firestore
+                        results_collection.add(result_dict)
+                        logger.info(f"Added model result {result_id} to Firestore")
+                except Exception as e:
+                    logger.error(f"Error processing model result: {e}")
+                    continue  # Skip this record and continue with others
+    except Exception as e:
+        logger.error(f"Error syncing model results: {e}")
+    
+    # Sync predictions to Firestore
+    try:
+        predictions = get_recent_predictions()
+        if not predictions.empty:
+            # Check if 'id' column exists, add it if it doesn't
+            if 'id' not in predictions.columns:
+                logger.warning("No 'id' column found in predictions. Adding generated IDs.")
+                predictions['id'] = [str(uuid.uuid4()) for _ in range(len(predictions))]
+                
+            predictions_collection = db_firestore.collection('predictions')
+            
+            # Check which predictions already exist in Firestore
+            existing_predictions = []
+            docs = predictions_collection.stream()
+            for doc in docs:
+                prediction_data = doc.to_dict()
+                if 'id' in prediction_data:
+                    existing_predictions.append(prediction_data['id'])
+            
+            # Add any new predictions
+            for index, prediction in predictions.iterrows():
+                try:
+                    # First convert the Series to a dictionary
+                    prediction_dict = prediction.to_dict()
+                    
+                    # Check if ID exists in the dictionary
+                    if 'id' not in prediction_dict:
+                        prediction_dict['id'] = str(uuid.uuid4())
+                    
+                    prediction_id = prediction_dict['id']
+                    if prediction_id not in existing_predictions:
+                        # Add to Firestore
+                        predictions_collection.add(prediction_dict)
+                        logger.info(f"Added prediction {prediction_id} to Firestore")
+                except Exception as e:
+                    logger.error(f"Error processing prediction: {e}")
+                    continue  # Skip this record and continue with others
+    except Exception as e:
+        logger.error(f"Error syncing predictions: {e}")
+    
+    # Sync verified outcomes from Firestore back to SQLite
+    sync_outcomes_from_firebase()
+
+def sync_outcomes_from_firebase():
+    """
+    Synchronize actual outcome data from Firestore to SQLite.
+    This allows the system to learn from user feedback.
+    """
+    db = sqlite3.connect(DB_PATH)
+    cursor = db.cursor()
+    
+    # Check if predictions table exists
+    cursor.execute("""
+        SELECT name FROM sqlite_master 
+        WHERE type='table' AND name='predictions'
+    """)
+    if not cursor.fetchone():
+        logger.info("Predictions table does not exist in SQLite, skipping outcome sync")
+        return
+    
+    # Check if the actualPitch column exists, add it if it doesn't
+    cursor.execute("PRAGMA table_info(predictions)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'actual_pitch' not in columns:
+        cursor.execute("ALTER TABLE predictions ADD COLUMN actual_pitch TEXT")
+        logger.info("Added actual_pitch column to predictions table")
+    
+    if 'was_correct' not in columns:
+        cursor.execute("ALTER TABLE predictions ADD COLUMN was_correct BOOLEAN")
+        logger.info("Added was_correct column to predictions table")
+    
+    # Get predictions from Firestore with actual outcomes
+    firebase_app = initialize_firebase()
+    db_firestore = firestore.client(firebase_app)
+    predictions_collection = db_firestore.collection('predictions')
+    
+    # Query for predictions that have actual outcomes recorded
+    verified_predictions = predictions_collection.where('actualPitch', '!=', None).stream()
+    
+    update_count = 0
+    for doc in verified_predictions:
+        prediction = doc.to_dict()
+        if 'id' in prediction and 'actualPitch' in prediction:
+            prediction_id = prediction['id']
+            actual_pitch = prediction['actualPitch']
+            was_correct = prediction.get('wasCorrect', False)
+            
+            # Update the prediction in SQLite with the actual outcome
+            cursor.execute("""
+                UPDATE predictions 
+                SET actual_pitch = ?, was_correct = ?
+                WHERE id = ? AND (actual_pitch IS NULL OR actual_pitch != ?)
+            """, (actual_pitch, was_correct, prediction_id, actual_pitch))
+            
+            if cursor.rowcount > 0:
+                update_count += 1
+                logger.info(f"Updated prediction {prediction_id} with actual pitch {actual_pitch}")
+    
+    db.commit()
+    logger.info(f"Synced {update_count} verified outcomes from Firestore to SQLite")
+    db.close()
 
 def create_firebase_config():
     """
-    Create Firebase configuration file template
+    Create Firebase configuration file template using environment variables
     """
-    config_path = 'firebase-config.json'
+    config_path = FIREBASE_CONFIG_PATH
     
     if os.path.exists(config_path):
         logger.info(f"Firebase config file already exists at {config_path}")
         return
     
+    # Get values from environment variables
     template = {
-        "apiKey": "YOUR_API_KEY",
-        "authDomain": "YOUR_PROJECT_ID.firebaseapp.com",
-        "databaseURL": "https://YOUR_PROJECT_ID.firebaseio.com",
-        "projectId": "YOUR_PROJECT_ID",
-        "storageBucket": "YOUR_PROJECT_ID.appspot.com",
-        "messagingSenderId": "YOUR_MESSAGING_SENDER_ID",
-        "appId": "YOUR_APP_ID"
+        "type": "service_account",
+        "project_id": os.getenv('VITE_FIREBASE_PROJECT_ID', 'YOUR_PROJECT_ID'),
+        "private_key_id": "YOUR_PRIVATE_KEY_ID",
+        "private_key": "YOUR_PRIVATE_KEY",
+        "client_email": "YOUR_CLIENT_EMAIL",
+        "client_id": "YOUR_CLIENT_ID",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": "YOUR_CLIENT_CERT_URL",
+        # Include other Firebase configs for reference
+        "apiKey": os.getenv('VITE_FIREBASE_API_KEY', 'YOUR_API_KEY'),
+        "authDomain": os.getenv('VITE_FIREBASE_AUTH_DOMAIN', 'YOUR_AUTH_DOMAIN'),
+        "storageBucket": os.getenv('VITE_FIREBASE_STORAGE_BUCKET', 'YOUR_STORAGE_BUCKET'),
+        "messagingSenderId": os.getenv('VITE_FIREBASE_MESSAGING_SENDER_ID', 'YOUR_MESSAGING_SENDER_ID'),
+        "appId": os.getenv('VITE_FIREBASE_APP_ID', 'YOUR_APP_ID')
     }
     
     with open(config_path, 'w') as f:
         json.dump(template, f, indent=2)
     
     logger.info(f"Created Firebase config template at {config_path}")
-    logger.info("Please update this file with your actual Firebase configuration")
+    logger.info("Please update this file with your actual Firestore service account credentials")
+    logger.info("Or set the GOOGLE_APPLICATION_CREDENTIALS environment variable to your service account JSON file path")
 
 def main():
     """Main function to execute Firebase sync"""
     logger.info("Starting Firebase sync")
     
-    # Create Firebase config template if needed
-    create_firebase_config()
+    # Ensure the Firebase config exists
+    if not os.path.exists(FIREBASE_CONFIG_PATH):
+        logger.warning(f"Firebase config file not found at {FIREBASE_CONFIG_PATH}")
+        logger.info("Will attempt to use environment variables, but some functionality may be limited")
     
     # Ensure SQLite database exists
     if not os.path.exists(DB_PATH):
@@ -307,14 +425,20 @@ def main():
         logger.info("Please run setup_database.py first")
         return
     
-    # Sync data to Firebase
-    sync_to_firebase()
+    # Initialize Firebase and sync data
+    db = initialize_firebase()
+    if db:
+        try:
+            sync_to_firebase()
+            logger.info("Firebase sync process completed successfully")
+        except Exception as e:
+            logger.error(f"Error during Firebase sync: {str(e)}")
+    else:
+        logger.error("Failed to initialize Firebase. Cannot sync data.")
     
-    logger.info("Firebase sync completed")
     logger.info("Next steps:")
-    logger.info("1. Update firebase-config.json with your Firebase configuration")
-    logger.info("2. Run this script periodically to keep Firebase in sync")
-    logger.info("3. Use the data in Firebase for your Vue+Vite frontend")
+    logger.info("1. The pitch prediction frontend can now access this data")
+    logger.info("2. Run this script periodically to keep Firebase in sync with your SQLite database")
 
 if __name__ == "__main__":
     main() 
