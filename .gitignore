@@ -48,6 +48,9 @@ models/results/*.png
 # Logs
 *.log
 
+# Firebase credentials
+firebase-config.json
+
 # Custom exceptions (add files you want to keep)
 # Keep these specific files if needed
 # !data/processed/sample_data.csv
