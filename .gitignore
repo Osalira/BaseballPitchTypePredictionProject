@@ -56,3 +56,4 @@ firebase-config.json
 # !data/processed/sample_data.csv
 # SQLite database
 data/*.db
+.env.production
